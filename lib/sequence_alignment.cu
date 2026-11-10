@@ -32,8 +32,11 @@ void allocate_offloaded_bt_d (wfa_backtrace_t** bt_offloaded_d,
                               const int max_steps,
                               const int num_blocks,
                               const size_t num_alignments) {
+    // Backtrace indices (bt_prev_t) are relative to each block's own region
+    // of the offloaded backtraces array, so the addressability check applies
+    // to the per-block size, not to the total.
     size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps);
-    size_t max_addressable_elements = 1L << (sizeof(bt_prev_t) * 8);
+    size_t max_addressable_elements = (size_t)1 << (sizeof(bt_prev_t) * 8);
 
     if (bt_offloaded_size >= max_addressable_elements) {
         LOG_ERROR("Trying to allocate more backtrace elements than the ones"
@@ -41,7 +44,8 @@ void allocate_offloaded_bt_d (wfa_backtrace_t** bt_offloaded_d,
         exit(-1);
     }
 
-    bt_offloaded_size *= num_blocks;
+    // The total across all blocks can exceed INT_MAX: keep it in size_t.
+    bt_offloaded_size *= (size_t)num_blocks;
 
     // Add the results array
     size_t bt_offloaded_results_size = BT_OFFLOADED_RESULT_ELEMENTS(max_steps)
@@ -63,7 +67,7 @@ void reset_offloaded_bt_d (wfa_backtrace_t* bt_offloaded_d,
                               cudaStream_t stream) {
     size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps);
 
-    bt_offloaded_size *= num_blocks;
+    bt_offloaded_size *= (size_t)num_blocks;
 
     // Add the results array
     size_t bt_offloaded_results_size = BT_OFFLOADED_RESULT_ELEMENTS(max_steps)
@@ -223,7 +227,7 @@ void launch_alignments_async (const char* packed_sequences_buffer,
                               size_t available_sh_mem_per_block,
                               int band,
                               cudaStream_t stream) {
-    size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps) * num_blocks;
+    size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps) * (size_t)num_blocks;
 
     wfa_backtrace_t* bt_offloaded_results_d = bt_offloaded_d
                                               + bt_offloaded_size;
@@ -339,7 +343,7 @@ void copyInResults (alignment_result_t* const results,
                     cudaStream_t stream) {
     const size_t bt_offloaded_results_size = BT_OFFLOADED_RESULT_ELEMENTS(max_steps)
                                              * num_alignments;
-    const size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps) * num_blocks;
+    const size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps) * (size_t)num_blocks;
 
     const wfa_backtrace_t* const bt_offloaded_results_d = bt_offloaded_d
                                               + bt_offloaded_size;

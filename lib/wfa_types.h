@@ -56,11 +56,15 @@ typedef enum {
 } gap_op_t;
 
 // Height * width
+// Evaluated in size_t: the per-block count fits in 32 bits (it is checked
+// against the width of bt_prev_t at allocation time), but the total for all
+// blocks (num_blocks * BT_OFFLOADED_ELEMENTS) can exceed INT_MAX on devices
+// with many SMs, so callers must not do this arithmetic in int.
 #define BT_OFFLOADED_ELEMENTS(max_steps) \
-                        (((max_steps) * 2 + 1) \
-                        * ((max_steps) * 2 / (wfa_backtrace_bits / 2)))
+                        (((size_t)(max_steps) * 2 + 1) \
+                        * ((size_t)(max_steps) * 2 / (wfa_backtrace_bits / 2)))
 
 #define BT_OFFLOADED_RESULT_ELEMENTS(max_steps) \
-                        ((max_steps) * 2 / (wfa_backtrace_bits / 2))
+                        ((size_t)(max_steps) * 2 / (wfa_backtrace_bits / 2))
 
 #endif
