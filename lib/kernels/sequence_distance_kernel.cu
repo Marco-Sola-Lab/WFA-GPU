@@ -65,7 +65,7 @@ __device__ static void next_M (wfa_distance_wavefront_t* M_wavefronts,
                         const size_t half_num_sh_offsets_per_wf,
                         const int d) {
     // The wavefront do not grow in case of mismatch
-    const wfa_distance_wavefront_t* prev_wf = &M_wavefronts[(curr_wf + x) % active_working_set_size];
+    const wfa_distance_wavefront_t* prev_wf = &M_wavefronts[ring_add(curr_wf, x, active_working_set_size)];
 
     const int hi = prev_wf->hi;
     const int lo = prev_wf->lo;
@@ -103,10 +103,10 @@ __device__ static void next_MDI (wfa_distance_wavefront_t* M_wavefronts,
                           const int plen,
                           const size_t half_num_sh_offsets_per_wf,
                           const int d) {
-    wfa_distance_wavefront_t* const prev_wf_x  = &M_wavefronts[(curr_wf + x) % active_working_set_size];
-    wfa_distance_wavefront_t* const prev_wf_o  = &M_wavefronts[(curr_wf + o + e) % active_working_set_size];
-    wfa_distance_wavefront_t* const prev_I_wf_e = &I_wavefronts[(curr_wf + e) % active_working_set_size];
-    wfa_distance_wavefront_t* const prev_D_wf_e = &D_wavefronts[(curr_wf + e) % active_working_set_size];
+    wfa_distance_wavefront_t* const prev_wf_x  = &M_wavefronts[ring_add(curr_wf, x, active_working_set_size)];
+    wfa_distance_wavefront_t* const prev_wf_o  = &M_wavefronts[ring_add(curr_wf, o + e, active_working_set_size)];
+    wfa_distance_wavefront_t* const prev_I_wf_e = &I_wavefronts[ring_add(curr_wf, e, active_working_set_size)];
+    wfa_distance_wavefront_t* const prev_D_wf_e = &D_wavefronts[ring_add(curr_wf, e, active_working_set_size)];
 
     const int hi_ID = MAX(prev_wf_o->hi, MAX(prev_I_wf_e->hi, prev_D_wf_e->hi)) + 1;
     const int hi    = MAX(prev_wf_x->hi, hi_ID);
@@ -157,19 +157,6 @@ __device__ static void next_MDI (wfa_distance_wavefront_t* M_wavefronts,
         D_wavefronts[curr_wf].lo = lo_ID;
         D_wavefronts[curr_wf].exist = true;
     }
-}
-
-__device__ static void update_curr_wf (wfa_distance_wavefront_t* M_wavefronts,
-                                       wfa_distance_wavefront_t* I_wavefronts,
-                                       wfa_distance_wavefront_t* D_wavefronts,
-                                       const int active_working_set_size,
-                                       const int max_wf_size,
-                                       int* curr_wf) {
-    // As we read wavefronts "forward" in the waveronts arrays, so the wavefront
-    // index is moved backwards.
-    const int wf_idx = (*curr_wf - 1 + active_working_set_size) % active_working_set_size;
-    *curr_wf = wf_idx;
-
 }
 
 __global__ void distance_kernel (
@@ -326,13 +313,7 @@ __global__ void distance_kernel (
         int steps = 0;
         if (!(target_k_abs <= distance && M_wavefronts[curr_wf].exist && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset)) {
 
-            update_curr_wf(
-                M_wavefronts,
-                I_wavefronts,
-                D_wavefronts,
-                active_working_set_size,
-                max_wf_size,
-                &curr_wf);
+            curr_wf = ring_dec(curr_wf, active_working_set_size);
 
             distance++;
             steps++;
@@ -342,9 +323,9 @@ __global__ void distance_kernel (
 
                 bool M_exist = false;
                 bool GAP_exist = false;
-                const int o_delta = (curr_wf + o + e) % active_working_set_size;
-                const int e_delta = (curr_wf + e) % active_working_set_size;
-                const int x_delta = (curr_wf + x) % active_working_set_size;
+                const int o_delta = ring_add(curr_wf, o + e, active_working_set_size);
+                const int e_delta = ring_add(curr_wf, e, active_working_set_size);
+                const int x_delta = ring_add(curr_wf, x, active_working_set_size);
                 if ((distance - o - e) >= 0) {
                     // Just test ~I matrix as it will exist at the same wavefronts
                     // as ~D
@@ -389,7 +370,12 @@ __global__ void distance_kernel (
                     // version
                     __syncthreads();
 
-                    if (target_k_abs <= distance && M_exist && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset) {
+                    // target_k must lie inside the wavefront: outside it the
+                    // offsets are stale or beyond the allocated diagonals
+                    if (target_k_abs <= distance && M_exist
+                        && target_k >= M_wavefronts[curr_wf].lo
+                        && target_k <= M_wavefronts[curr_wf].hi
+                        && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset) {
                         finished = true;
                         break;
                     }
@@ -397,13 +383,7 @@ __global__ void distance_kernel (
                     distance++;
                 }
 
-            update_curr_wf(
-                M_wavefronts,
-                I_wavefronts,
-                D_wavefronts,
-                active_working_set_size,
-                max_wf_size,
-                &curr_wf);
+            curr_wf = ring_dec(curr_wf, active_working_set_size);
 
             __syncthreads();
             }

@@ -52,3 +52,7 @@ void get_cuda_capability(int dev, int* major, int* minor) {
     *major = deviceProp.major;
     *minor = deviceProp.minor;
 }
+
+extern "C" void init_cuda_context(void) {
+    cudaFree(0);
+}

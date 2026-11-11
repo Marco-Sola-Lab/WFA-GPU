@@ -40,9 +40,30 @@ typedef struct {
     // offsets at global memory
     wfa_offset_t* offsets[2];
     bool exist;
-    bt_vector_t* backtraces_vectors;
-    bt_prev_t* backtraces_pointers;
+    // {backtrace vector, prev pointer} per diagonal
+    wfa_backtrace_t* bt;
 } wfa_wavefront_t;
+
+// Elements of one global working-set array (offsets or backtraces) holding
+// `num_wfs` wavefronts. Padded so every array starts 32-bit aligned.
+__host__ __device__ inline int alignment_wf_elements (const int num_wfs,
+                                                      const int max_steps) {
+    const int n = num_wfs * (2 * max_steps + 1);
+    return n + (4 - (n % 4));
+}
+
+// Bytes of global working set used by each alignment_kernel block: ~M keeps
+// max(o+e, x)+1 wavefronts, ~I and ~D only e+1 (they are read at s-e).
+// Shared by the host allocation and the kernel's per-block layout.
+__host__ __device__ inline size_t alignment_wf_data_buffer_size (
+                                            const affine_penalties_t penalties,
+                                            const int max_steps) {
+    const int aws = max(penalties.o + penalties.e, penalties.x) + 1;
+    const int ws_id = penalties.e + 1;
+    const size_t elements = alignment_wf_elements(aws, max_steps)
+                            + 2 * (size_t)alignment_wf_elements(ws_id, max_steps);
+    return elements * (sizeof(wfa_offset_t) + sizeof(wfa_backtrace_t));
+}
 
 __global__ void alignment_kernel (
                             const char* packed_sequences_buffer,

@@ -60,27 +60,6 @@ void allocate_offloaded_bt_d (wfa_backtrace_t** bt_offloaded_d,
     CUDA_CHECK_ERR
 }
 
-void reset_offloaded_bt_d (wfa_backtrace_t* bt_offloaded_d,
-                              const int max_steps,
-                              const int num_blocks,
-                              const size_t num_alignments,
-                              cudaStream_t stream) {
-    size_t bt_offloaded_size = BT_OFFLOADED_ELEMENTS(max_steps);
-
-    bt_offloaded_size *= (size_t)num_blocks;
-
-    // Add the results array
-    size_t bt_offloaded_results_size = BT_OFFLOADED_RESULT_ELEMENTS(max_steps)
-                                       * num_alignments;
-
-    cudaMemsetAsync(
-        bt_offloaded_d,
-        0,
-        (bt_offloaded_size + bt_offloaded_results_size) * sizeof(wfa_backtrace_t),
-        stream
-    );
-    CUDA_CHECK_ERR
-}
 
 size_t available_shared_mem_per_block (const affine_penalties_t penalties,
                                        const size_t max_steps,
@@ -99,8 +78,10 @@ size_t available_shared_mem_per_block (const affine_penalties_t penalties,
     // being the registers used.
     const int max_active_warps_per_sm = min(32, max_occupancy);
 
-    const int warps_per_block = threads_per_block / deviceProp.warpSize;
-    const int blocks_per_sm = max_active_warps_per_sm / warps_per_block;
+    const int warps_per_block = max(1, threads_per_block / deviceProp.warpSize);
+    // Small blocks are limited by the maximum resident blocks per SM
+    const int blocks_per_sm = max(1, min(max_active_warps_per_sm / warps_per_block,
+                                         deviceProp.maxBlocksPerMultiProcessor));
     const size_t usable_sh_mem_per_block = min(shared_mem_per_multiprocessor / blocks_per_sm,
                                                shared_mem_per_block);
 
@@ -112,7 +93,11 @@ size_t available_shared_mem_per_block (const affine_penalties_t penalties,
 }
 
 size_t wf_data_buffer_size (const affine_penalties_t penalties,
-                             const size_t max_steps) {
+                             const size_t max_steps,
+                             const int band) {
+    if (band <= 0) return alignment_wf_data_buffer_size(penalties, max_steps);
+
+    // Banded kernel: 3 rings of max(o+e, x)+1 wavefronts each
     const int max_wf_size = 2 * max_steps + 1;
     const int active_working_set = max(penalties.o+penalties.e, penalties.x) + 1;
     int offsets_elements = active_working_set * max_wf_size;
@@ -141,10 +126,11 @@ size_t wf_data_buffer_size_distance (const affine_penalties_t penalties,
 void allocate_wf_data_buffer_d (uint8_t** wf_data_buffer,
                                 const size_t max_steps,
                                 const affine_penalties_t penalties,
-                                const size_t num_blocks) {
+                                const size_t num_blocks,
+                                const int band) {
 
     // Create the active working set buffer on global memory
-    size_t buffer_size = wf_data_buffer_size(penalties, max_steps);
+    size_t buffer_size = wf_data_buffer_size(penalties, max_steps, band);
     LOG_DEBUG("Working set size per block: %.2f KiB",
               (float)(buffer_size) / (1 << 10))
     buffer_size *= num_blocks;
@@ -180,21 +166,6 @@ void allocate_wf_data_buffer_distance_d (uint8_t** wf_data_buffer,
     CUDA_CHECK_ERR;
 }
 
-void reset_wf_data_buffer_d (uint8_t* wf_data_buffer,
-                             const size_t max_steps,
-                             const affine_penalties_t penalties,
-                             const size_t num_blocks,
-                             cudaStream_t stream) {
-
-    if (wf_data_buffer == NULL) return;
-    // Create the active working set buffer on global memory
-    size_t buffer_size = wf_data_buffer_size(penalties, max_steps);
-    buffer_size *= num_blocks;
-    buffer_size += sizeof(uint32_t);
-
-    cudaMemsetAsync(wf_data_buffer, 0, buffer_size, stream);
-    CUDA_CHECK_ERR;
-}
 
 void reset_wf_data_buffer_distance_d (uint8_t* wf_data_buffer,
                                       const size_t max_steps,
@@ -248,25 +219,31 @@ void launch_alignments_async (const char* packed_sequences_buffer,
                     + sizeof(int);
     } else {
         sh_mem_size = \
-                    // Wavefronts structs space
-                    + (active_working_set * sizeof(wfa_wavefront_t) * 3)
+                    // Wavefronts structs space (~I/~D rings have e+1 slots)
+                    + ((active_working_set + 2 * (penalties.e + 1)) * sizeof(wfa_wavefront_t))
                     // Position of the last used element in the offloaded
                     // backtraces. It will be atomically increased.
                     + sizeof(int);
 
     }
 
-    available_sh_mem_per_block -= sh_mem_size;
+    // The wavefront structs alone may not fit in the per-block budget (small
+    // blocks, large penalties): then keep only the minimum shared offsets
+    available_sh_mem_per_block = (available_sh_mem_per_block > sh_mem_size)
+                                 ? (available_sh_mem_per_block - sh_mem_size) : 0;
     // Using 100% of the shared memory available can give some problems, as the
     // driver sometimes take some sh memory space (?)
     available_sh_mem_per_block *= 0.95;
 
+    // Non-banded kernel: ~I/~D rings only have e+1 wavefronts
+    const int num_sh_wfs = (band > 0) ? (active_working_set * 3)
+                                      : (active_working_set + 2 * (penalties.e + 1));
     const int max_sh_offsets_per_block = available_sh_mem_per_block / sizeof(wfa_offset_t);
-    int max_sh_offsets_per_wf = max_sh_offsets_per_block / (active_working_set * 3);
+    int max_sh_offsets_per_wf = max_sh_offsets_per_block / num_sh_wfs;
 
     // Make sure it fits in shared memory taking into account the wavefronts
     // metadata
-    while ((max_sh_offsets_per_wf * sizeof(wfa_offset_t) * active_working_set * 3)
+    while ((max_sh_offsets_per_wf * sizeof(wfa_offset_t) * num_sh_wfs)
                 > available_sh_mem_per_block) {
         max_sh_offsets_per_wf--;
     }
@@ -284,15 +261,18 @@ void launch_alignments_async (const char* packed_sequences_buffer,
         if ((max_sh_offsets_per_wf % 2) == 0) {
             max_sh_offsets_per_wf--;
         }
+        // At least diagonal 0 in shared memory
+        if (max_sh_offsets_per_wf < 1) max_sh_offsets_per_wf = 1;
     }
 
     // Add offsets size to shared memory
-    sh_mem_size += max_sh_offsets_per_wf * sizeof(wfa_offset_t) * active_working_set * 3;
+    sh_mem_size += max_sh_offsets_per_wf * sizeof(wfa_offset_t) * num_sh_wfs;
 
     uint32_t* next_alignment_idx = (uint32_t*)(wf_data_buffer
                                            + wf_data_buffer_size(
                                                penalties,
-                                               max_steps
+                                               max_steps,
+                                               band
                                            ) * num_blocks);
     dim3 gridSize(num_blocks);
     dim3 blockSize(threads_per_block);

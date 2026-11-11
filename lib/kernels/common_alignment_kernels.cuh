@@ -26,6 +26,17 @@
 
 #define OFFSET_NULL -32000
 
+// (a + b) mod n for 0 <= a < n and 0 <= b < n, without an integer division
+__device__ __forceinline__ static int ring_add (const int a, const int b, const int n) {
+    const int r = a + b;
+    return (r >= n) ? (r - n) : r;
+}
+
+// (a - 1) mod n for 0 <= a < n
+__device__ __forceinline__ static int ring_dec (const int a, const int n) {
+    return (a == 0) ? (n - 1) : (a - 1);
+}
+
 __device__ static wfa_offset_t WF_extend_kernel (const char* text,
                                   const char* pattern,
                                   const int tlen,

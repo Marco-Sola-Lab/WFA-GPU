@@ -27,6 +27,7 @@
 #include "utils/device_query.cuh"
 #include "include/wfa_gpu.h"
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -53,6 +54,13 @@ const char* menu_categories[] = {
     "Alignment Options", // 1
     "System"             // 2
 };
+
+// pthread entry point: create the CUDA context in the background
+static void* init_cuda_context_thread (void* arg) {
+    (void)arg;
+    init_cuda_context();
+    return NULL;
+}
 
 
 int main(int argc, char** argv) {
@@ -284,6 +292,11 @@ int main(int argc, char** argv) {
 
     LOG_INFO("Penalties: M=0, X=%d, O=%d, E=%d.", penalties.x, penalties.o, penalties.e)
 
+    // Create the CUDA context while the input file is read
+    pthread_t ctx_thread;
+    bool ctx_thread_ok = (pthread_create(&ctx_thread, NULL,
+                                         init_cuda_context_thread, NULL) == 0);
+
     LOG_INFO("Reading sequences file...")
     CLOCK_INIT()
     CLOCK_START()
@@ -307,6 +320,7 @@ int main(int argc, char** argv) {
 
     CLOCK_STOP()
     CLOCK_REPORT("File read")
+    if (ctx_thread_ok) pthread_join(ctx_thread, NULL);
 
     int max_distance;
     option_t* opt_max_distance = get_option(options, 'e');
@@ -349,12 +363,23 @@ int main(int argc, char** argv) {
     } else {
         // If it is not provided by the user, use the maximum distance as a
         // hint.
-        const size_t max_wf_size = 2 * max_distance + 1;
-        if (max_wf_size <= 128)       threads_per_block = 64;
-        else if (max_wf_size <= 256) threads_per_block = 128;
-        else if (max_wf_size <= 512) threads_per_block = 256;
-        else if (max_wf_size <= 1024) threads_per_block = 512;
-        else                         threads_per_block = 1024;
+        if (get_option(options, 'B')->parsed) {
+            // Banded: the number of threads is also the band width, so it
+            // must cover the whole 2*max_distance+1 wavefront
+            const size_t max_wf_size = 2 * max_distance + 1;
+            if (max_wf_size <= 128)       threads_per_block = 64;
+            else if (max_wf_size <= 256)  threads_per_block = 128;
+            else if (max_wf_size <= 512)  threads_per_block = 256;
+            else if (max_wf_size <= 1024) threads_per_block = 512;
+            else                          threads_per_block = 1024;
+        } else {
+            // Wavefronts are much narrower than 2*max_distance+1 in practice;
+            // max_distance/4 (rounded up to a power of two) tracks the
+            // measured optimum for short, medium and long reads.
+            threads_per_block = 32;
+            while (threads_per_block < 1024 && threads_per_block < max_distance / 4)
+                threads_per_block *= 2;
+        }
     }
 
     size_t num_alignments;

@@ -31,6 +31,8 @@ void get_num_cuda_devices(int* n);
 char* get_cuda_dev_name(int dev);
 int get_cuda_SM_count(int dev);
 void get_cuda_capability(int dev, int* major, int* minor);
+// Force creation of the CUDA context (it is otherwise created lazily)
+void init_cuda_context(void);
 
 #if __cplusplus
 }

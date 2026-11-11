@@ -200,12 +200,14 @@ void launch_alignments (char* sequences_buffer,
 
     uint8_t* wf_data_buffer;
     allocate_wf_data_buffer_d(&wf_data_buffer, max_distance,
-                              penalties, num_blocks);
+                              penalties, num_blocks, band);
 
+    // Global counter of the next alignment to compute, after the working sets
     uint32_t* next_alignment_idx_d = (uint32_t*)(wf_data_buffer +
                                      wf_data_buffer_size(
                                          penalties,
-                                         max_distance)
+                                         max_distance,
+                                         band) * num_blocks
                                      );
 
     int from, to, curr_batch_size, batch;
@@ -231,11 +233,10 @@ void launch_alignments (char* sequences_buffer,
                         cudaMemcpyHostToDevice, stream1);
         CUDA_CHECK_ERR
 
-        // TODO: Needed (?)
-        // Reset the memory regions for the alignment kernel
-        reset_offloaded_bt_d(bt_offloaded_d, max_distance, num_blocks, batch_size, stream2);
-        reset_wf_data_buffer_d(wf_data_buffer, max_distance,
-                                  penalties, num_blocks, stream2);
+        // The kernel keeps the working set clean and never reads offloaded
+        // backtraces it did not write, only the alignment counter needs reset.
+        cudaMemsetAsync(next_alignment_idx_d, 0, sizeof(uint32_t), stream2);
+        CUDA_CHECK_ERR
 
 
         // Wait for unpacked sequences memcpys to finish

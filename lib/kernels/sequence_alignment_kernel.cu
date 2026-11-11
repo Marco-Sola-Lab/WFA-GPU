@@ -36,12 +36,12 @@ __device__ static bt_prev_t offload_backtrace (unsigned int* const last_free_bt_
                                        wfa_backtrace_t* const global_backtraces_array) {
     const bt_prev_t old_val = atomicAdd(last_free_bt_position, 1);
 
+    // Single 64-bit store of {backtrace, prev}
+    const uint2 packed = make_uint2(backtrace_vector, backtrace_pointer);
 #if __CUDA_ARCH__ >= 800
-    __stwt(&global_backtraces_array[old_val].backtrace, backtrace_vector);
-    __stwt(&global_backtraces_array[old_val].prev, backtrace_pointer);
+    __stwt((uint2*)&global_backtraces_array[old_val], packed);
 #else
-    global_backtraces_array[old_val].backtrace = backtrace_vector;
-    global_backtraces_array[old_val].prev = backtrace_pointer;
+    *(uint2*)&global_backtraces_array[old_val] = packed;
 #endif
 
     // TODO: Check if new_val is more than 32 bits
@@ -77,6 +77,29 @@ __device__ static void set_offset (wfa_wavefront_t* const wf,
     wf->offsets[is_global][k] = value;
 }
 
+__device__ __forceinline__ static uint2 ld_bt (const wfa_backtrace_t* p) {
+    return *(const uint2*)p;
+}
+
+__device__ __forceinline__ static void st_bt (wfa_backtrace_t* p, const uint2 v) {
+    *(uint2*)p = v;
+}
+
+__device__ __forceinline__ static uint2 push_op (uint2 bt,
+                                    const affine_op_t op,
+                                    unsigned int* const last_free_bt_position,
+                                    wfa_backtrace_t* const offloaded_backtraces) {
+    bt.x = (bt.x << 2) | op;
+    if (BT_IS_FULL(bt.x)) {
+        const bt_prev_t prev = offload_backtrace(last_free_bt_position,
+                                                 bt.x, bt.y,
+                                                 offloaded_backtraces);
+        bt.x = 0;
+        bt.y = prev;
+    }
+    return bt;
+}
+
 __device__ static void next_M (wfa_wavefront_t* M_wavefronts,
                         const int curr_wf,
                         const int active_working_set_size,
@@ -90,37 +113,24 @@ __device__ static void next_M (wfa_wavefront_t* M_wavefronts,
                         wfa_backtrace_t* const offloaded_backtraces,
                         const int d) {
     // The wavefront do not grow in case of mismatch
-    const wfa_wavefront_t* prev_wf = &M_wavefronts[(curr_wf + x) % active_working_set_size];
+    const wfa_wavefront_t* prev_wf = &M_wavefronts[ring_add(curr_wf, x, active_working_set_size)];
 
     const int hi = prev_wf->hi;
     const int lo = prev_wf->lo;
 
     for (int k=lo + threadIdx.x; k <= hi; k+=blockDim.x) {
         wfa_offset_t curr_offset = get_offset(prev_wf, k, half_num_sh_offsets_per_wf) + 1;
-
-        bt_vector_t prev_bt_vector = prev_wf->backtraces_vectors[k];
-        bt_prev_t prev_bt_pointer = prev_wf->backtraces_pointers[k];
+        uint2 bt = ld_bt(&prev_wf->bt[k]);
 
         // Only extend and update backtrace if the previous offset exist
         if (curr_offset >= 0) {
             curr_offset = WF_extend_kernel(text, pattern,
                                            tlen, plen, k, curr_offset);
-
-            prev_bt_vector = (prev_bt_vector << 2) | OP_SUB;
-
-            if (BT_IS_FULL(prev_bt_vector)) {
-                bt_prev_t prev = offload_backtrace(last_free_bt_position,
-                                         prev_bt_vector,
-                                         prev_bt_pointer,
-                                         offloaded_backtraces);
-                prev_bt_vector = 0;
-                prev_bt_pointer = prev;
-            }
+            bt = push_op(bt, OP_SUB, last_free_bt_position, offloaded_backtraces);
         }
 
         set_offset(&M_wavefronts[curr_wf], k, half_num_sh_offsets_per_wf, curr_offset);
-        M_wavefronts[curr_wf].backtraces_vectors[k] = prev_bt_vector;
-        M_wavefronts[curr_wf].backtraces_pointers[k] = prev_bt_pointer;
+        st_bt(&M_wavefronts[curr_wf].bt[k], bt);
     }
 
     if (threadIdx.x == 0) {
@@ -135,6 +145,8 @@ __device__ static void next_MDI (wfa_wavefront_t* M_wavefronts,
                           wfa_wavefront_t* D_wavefronts,
                           const int curr_wf,
                           const int active_working_set_size,
+                          const int curr_id,
+                          const int ws_id,
                           const int x,
                           const int o,
                           const int e,
@@ -146,10 +158,11 @@ __device__ static void next_MDI (wfa_wavefront_t* M_wavefronts,
                           unsigned int* const last_free_bt_position,
                           wfa_backtrace_t* const offloaded_backtraces,
                           const int d) {
-    wfa_wavefront_t* const prev_wf_x  = &M_wavefronts[(curr_wf + x) % active_working_set_size];
-    wfa_wavefront_t* const prev_wf_o  = &M_wavefronts[(curr_wf + o + e) % active_working_set_size];
-    wfa_wavefront_t* const prev_I_wf_e = &I_wavefronts[(curr_wf + e) % active_working_set_size];
-    wfa_wavefront_t* const prev_D_wf_e = &D_wavefronts[(curr_wf + e) % active_working_set_size];
+    wfa_wavefront_t* const prev_wf_x  = &M_wavefronts[ring_add(curr_wf, x, active_working_set_size)];
+    wfa_wavefront_t* const prev_wf_o  = &M_wavefronts[ring_add(curr_wf, o + e, active_working_set_size)];
+    // ~I/~D only need the wavefront at s-e: their ring has e+1 slots
+    wfa_wavefront_t* const prev_I_wf_e = &I_wavefronts[ring_add(curr_id, e, ws_id)];
+    wfa_wavefront_t* const prev_D_wf_e = &D_wavefronts[ring_add(curr_id, e, ws_id)];
 
     const int hi_ID = MAX(prev_wf_o->hi, MAX(prev_I_wf_e->hi, prev_D_wf_e->hi)) + 1;
     const int hi    = MAX(prev_wf_x->hi, hi_ID);
@@ -157,171 +170,58 @@ __device__ static void next_MDI (wfa_wavefront_t* M_wavefronts,
     const int lo    = MIN(prev_wf_x->lo, lo_ID);
 
     for (int k=lo + threadIdx.x; k <= hi; k+=blockDim.x) {
-        // ~I offsets
-        const wfa_offset_t I_gap_open_offset = get_offset(prev_wf_o, k - 1, half_num_sh_offsets_per_wf) + 1;
-        const bt_vector_t I_gap_open_bt_vector = prev_wf_o->backtraces_vectors[k - 1];
-        const bt_prev_t I_gap_open_bt_pointer = prev_wf_o->backtraces_pointers[k - 1];
+        const wfa_offset_t I_open_off = get_offset(prev_wf_o, k - 1, half_num_sh_offsets_per_wf) + 1;
+        const wfa_offset_t I_ext_off  = get_offset(prev_I_wf_e, k - 1, half_num_sh_offsets_per_wf) + 1;
+        const wfa_offset_t D_open_off = get_offset(prev_wf_o, k + 1, half_num_sh_offsets_per_wf);
+        const wfa_offset_t D_ext_off  = get_offset(prev_D_wf_e, k + 1, half_num_sh_offsets_per_wf);
+        const wfa_offset_t X_off      = get_offset(prev_wf_x, k, half_num_sh_offsets_per_wf) + 1;
 
-        const int64_t I_gap_open_offset_pb = (int64_t)
-                                  ((uint64_t)I_gap_open_offset << 32)
-                                  | GAP_OPEN;
+        // Load all predecessors' backtraces up front so the loads overlap
+        const uint2 I_open_bt = ld_bt(&prev_wf_o->bt[k - 1]);
+        const uint2 I_ext_bt  = ld_bt(&prev_I_wf_e->bt[k - 1]);
+        const uint2 D_open_bt = ld_bt(&prev_wf_o->bt[k + 1]);
+        const uint2 D_ext_bt  = ld_bt(&prev_D_wf_e->bt[k + 1]);
+        const uint2 X_bt      = ld_bt(&prev_wf_x->bt[k]);
 
-        const wfa_offset_t I_gap_extend_offset = get_offset(prev_I_wf_e, k - 1, half_num_sh_offsets_per_wf) + 1;
-        const bt_vector_t I_gap_extend_bt_vector = prev_I_wf_e->backtraces_vectors[k - 1];
-        const bt_prev_t I_gap_extend_bt_pointer = prev_I_wf_e->backtraces_pointers[k - 1];
-
-        const int64_t I_gap_extend_offset_pb = (int64_t)
-                                ((uint64_t)I_gap_extend_offset << 32)
-                                | GAP_EXTEND;
-
-        int64_t I_offset_pb = MAX_PB(I_gap_open_offset_pb,
-                                     I_gap_extend_offset_pb);
-
-        const wfa_offset_t I_offset = (wfa_offset_t)(I_offset_pb >> 32);
-        set_offset(&I_wavefronts[curr_wf], k, half_num_sh_offsets_per_wf, I_offset);
-
-        // ~I backtraces
-        bt_vector_t I_backtrace_vector = 0;
-        bt_prev_t I_backtrace_pointer = 0;
-        // Only update backtrace if offset exist
+        // ~I: on ties gap extension wins over gap opening
+        const bool I_is_ext = (I_ext_off >= I_open_off);
+        const wfa_offset_t I_offset = I_is_ext ? I_ext_off : I_open_off;
+        set_offset(&I_wavefronts[curr_id], k, half_num_sh_offsets_per_wf, I_offset);
+        uint2 I_bt = make_uint2(0, 0);
         if (I_offset >= 0) {
-            const gap_op_t I_op = (gap_op_t)(I_offset_pb & 0xffffffff);
-
-            if (I_op == GAP_OPEN) {
-                I_backtrace_vector = I_gap_open_bt_vector;
-                I_backtrace_pointer = I_gap_open_bt_pointer;
-            } else {
-                I_backtrace_vector = I_gap_extend_bt_vector;
-                I_backtrace_pointer = I_gap_extend_bt_pointer;
-            }
-
-            I_backtrace_vector = (I_backtrace_vector << 2) | OP_INS;
-
-            // Offload ~I backtraces if the bitvector is full, and reset current
-            // backtrace
-            if (BT_IS_FULL(I_backtrace_vector)) {
-                bt_prev_t prev = offload_backtrace(last_free_bt_position,
-                                                  I_backtrace_vector,
-                                                  I_backtrace_pointer,
-                                                  offloaded_backtraces);
-                I_backtrace_vector = 0;
-                I_backtrace_pointer = prev;
-            }
-
+            I_bt = I_is_ext ? I_ext_bt : I_open_bt;
+            I_bt = push_op(I_bt, OP_INS, last_free_bt_position, offloaded_backtraces);
         }
+        st_bt(&I_wavefronts[curr_id].bt[k], I_bt);
 
-        I_wavefronts[curr_wf].backtraces_vectors[k] = I_backtrace_vector;
-        I_wavefronts[curr_wf].backtraces_pointers[k] = I_backtrace_pointer;
-        I_offset_pb = (uint64_t)(((uint64_t)I_offset << 32) | OP_INS);
-
-        // ------- End of ~I processing -------
-
-        // ~D offsets
-        const wfa_offset_t D_gap_open_offset = get_offset(prev_wf_o, k + 1, half_num_sh_offsets_per_wf);
-        const bt_vector_t D_gap_open_bt_vector = prev_wf_o->backtraces_vectors[k + 1];
-        const bt_prev_t D_gap_open_bt_pointer = prev_wf_o->backtraces_pointers[k + 1];
-
-        const int64_t D_gap_open_offset_pb = (int64_t)
-                                  ((uint64_t)D_gap_open_offset << 32)
-                                  | GAP_OPEN;
-
-        const wfa_offset_t D_gap_extend_offset = get_offset(prev_D_wf_e, k + 1, half_num_sh_offsets_per_wf);
-        const bt_vector_t D_gap_extend_bt_vector = prev_D_wf_e->backtraces_vectors[k + 1];
-        const bt_prev_t D_gap_extend_bt_pointer = prev_D_wf_e->backtraces_pointers[k + 1];
-
-        const int64_t D_gap_extend_offset_pb = (int64_t)
-                                    ((uint64_t)D_gap_extend_offset << 32)
-                                    | GAP_EXTEND;
-
-        int64_t D_offset_pb = MAX_PB(D_gap_open_offset_pb,
-                                     D_gap_extend_offset_pb);
-
-        const wfa_offset_t D_offset = (wfa_offset_t)(D_offset_pb >> 32);
-        set_offset(&D_wavefronts[curr_wf], k, half_num_sh_offsets_per_wf, D_offset);
-
-        // ~D backtraces
-        bt_vector_t D_backtrace_vector = 0;
-        bt_prev_t D_backtrace_pointer = 0;
-
+        // ~D
+        const bool D_is_ext = (D_ext_off >= D_open_off);
+        const wfa_offset_t D_offset = D_is_ext ? D_ext_off : D_open_off;
+        set_offset(&D_wavefronts[curr_id], k, half_num_sh_offsets_per_wf, D_offset);
+        uint2 D_bt = make_uint2(0, 0);
         if (D_offset >= 0) {
-            const gap_op_t D_op = (gap_op_t)(D_offset_pb & 0xffffffff);
-
-            if (D_op == GAP_OPEN) {
-                D_backtrace_vector = D_gap_open_bt_vector;
-                D_backtrace_pointer = D_gap_open_bt_pointer;
-            } else {
-                D_backtrace_vector = D_gap_extend_bt_vector;
-                D_backtrace_pointer = D_gap_extend_bt_pointer;
-            }
-
-            D_backtrace_vector = (D_backtrace_vector << 2) | OP_DEL;
-
-            // Offload ~D backtraces if the bitvector is full
-            if (BT_IS_FULL(D_backtrace_vector)) {
-                bt_prev_t prev = offload_backtrace(last_free_bt_position,
-                                                  D_backtrace_vector,
-                                                  D_backtrace_pointer,
-                                                  offloaded_backtraces);
-                D_backtrace_vector = 0;
-                D_backtrace_pointer = prev;
-            }
+            D_bt = D_is_ext ? D_ext_bt : D_open_bt;
+            D_bt = push_op(D_bt, OP_DEL, last_free_bt_position, offloaded_backtraces);
         }
+        st_bt(&D_wavefronts[curr_id].bt[k], D_bt);
 
-        D_wavefronts[curr_wf].backtraces_vectors[k] = D_backtrace_vector;
-        D_wavefronts[curr_wf].backtraces_pointers[k] = D_backtrace_pointer;
-
-        D_offset_pb = (uint64_t)(((uint64_t)D_offset << 32) | OP_DEL);
-
-        // ------- End of ~D processing -------
-
-        // ~M update
-        const wfa_offset_t X_offset = get_offset(prev_wf_x, k, half_num_sh_offsets_per_wf) + 1;
-        const bt_vector_t X_backtrace_vector = prev_wf_x->backtraces_vectors[k];
-        const bt_prev_t X_backtrace_pointer = prev_wf_x->backtraces_pointers[k];
-
-        const int64_t X_offset_pb = (int64_t)
-                                     (((uint64_t)X_offset << 32)
-                                     | OP_SUB);
-
-        const int64_t M_offset_pb = MAX_PB(
-                                        MAX_PB(X_offset_pb, D_offset_pb),
-                                        I_offset_pb
-                                        );
-        // Extend
-        wfa_offset_t M_offset = (wfa_offset_t)(M_offset_pb >> 32);
-        bt_vector_t M_backtrace_vector = 0;
-        bt_prev_t M_backtrace_pointer = 0;
+        // ~M: on ties DEL > SUB > INS (same order as the banded kernel's MAX_PB)
+        wfa_offset_t M_offset = MAX(X_off, MAX(D_offset, I_offset));
+        uint2 M_bt = make_uint2(0, 0);
         if (M_offset >= 0) {
-            M_offset = WF_extend_kernel(text, pattern, tlen, plen, k, M_offset);
-
-            affine_op_t M_op = (affine_op_t)(M_offset_pb & 0xffffffff);
-            if (M_op == OP_SUB) {
-                M_backtrace_vector = X_backtrace_vector;
-                M_backtrace_pointer = X_backtrace_pointer;
-            } else if (M_op == OP_INS) {
-                M_backtrace_vector = I_backtrace_vector;
-                M_backtrace_pointer = I_backtrace_pointer;
+            if (D_offset == M_offset) {
+                M_bt = D_bt;
+            } else if (X_off == M_offset) {
+                M_bt = X_bt;
             } else {
-                M_backtrace_vector = D_backtrace_vector;
-                M_backtrace_pointer = D_backtrace_pointer;
+                M_bt = I_bt;
             }
-
-            M_backtrace_vector = (M_backtrace_vector << 2) | OP_SUB;
-
-            // Offload backtraces if the bitvector is full
-            if (BT_IS_FULL(M_backtrace_vector)) {
-                bt_prev_t prev = offload_backtrace(last_free_bt_position,
-                                                  M_backtrace_vector,
-                                                  M_backtrace_pointer,
-                                                  offloaded_backtraces);
-                M_backtrace_vector = 0;
-                M_backtrace_pointer = prev;
-            }
+            M_offset = WF_extend_kernel(text, pattern, tlen, plen, k, M_offset);
+            M_bt = push_op(M_bt, OP_SUB, last_free_bt_position, offloaded_backtraces);
         }
 
         set_offset(&M_wavefronts[curr_wf], k, half_num_sh_offsets_per_wf,  M_offset);
-        M_wavefronts[curr_wf].backtraces_vectors[k] = M_backtrace_vector;
-        M_wavefronts[curr_wf].backtraces_pointers[k] = M_backtrace_pointer;
+        st_bt(&M_wavefronts[curr_wf].bt[k], M_bt);
     }
 
     if (threadIdx.x == 0) {
@@ -329,26 +229,12 @@ __device__ static void next_MDI (wfa_wavefront_t* M_wavefronts,
         M_wavefronts[curr_wf].lo = lo;
         M_wavefronts[curr_wf].exist = true;
 
-        I_wavefronts[curr_wf].hi = hi_ID;
-        I_wavefronts[curr_wf].lo = lo_ID;
-        I_wavefronts[curr_wf].exist = true;
+        I_wavefronts[curr_id].hi = hi_ID;
+        I_wavefronts[curr_id].lo = lo_ID;
 
-        D_wavefronts[curr_wf].hi = hi_ID;
-        D_wavefronts[curr_wf].lo = lo_ID;
-        D_wavefronts[curr_wf].exist = true;
+        D_wavefronts[curr_id].hi = hi_ID;
+        D_wavefronts[curr_id].lo = lo_ID;
     }
-}
-
-__device__ static void update_curr_wf (wfa_wavefront_t* M_wavefronts,
-                                wfa_wavefront_t* I_wavefronts,
-                                wfa_wavefront_t* D_wavefronts,
-                                const int active_working_set_size,
-                                const int max_wf_size,
-                                int* curr_wf) {
-    // As we read wavefronts "forward" in the waveronts arrays, so the wavefront
-    // index is moved backwards.
-    const int wf_idx = (*curr_wf - 1 + active_working_set_size) % active_working_set_size;
-    *curr_wf = wf_idx;
 }
 
 
@@ -395,74 +281,72 @@ __global__ void alignment_kernel (
     const int max_wf_size = 2 * max_steps + 1;
     const int max_wf_size_bt = 2 * max_steps + 1;
 
+    // ~I and ~D wavefronts are only read at distance s-e
+    const int ws_id = e + 1;
+
     // Offsets and backtraces must be 32 bits aligned to avoid unaligned access
     // errors on the structs
-    int offsets_size = active_working_set_size * max_wf_size;
-    offsets_size = offsets_size + (4 - (offsets_size % 4));
+    const int offsets_size = alignment_wf_elements(active_working_set_size, max_steps);
+    const int bt_size = offsets_size;
+    const int offsets_size_id = alignment_wf_elements(ws_id, max_steps);
+    const int bt_size_id = offsets_size_id;
 
-    int bt_size = active_working_set_size * max_wf_size_bt;
-    bt_size = bt_size + (4 - (bt_size % 4));
-
-    const size_t wf_data_buffer_size =
-                    // Offsets space
-                    (offsets_size * 3 * sizeof(wfa_offset_t))
-                    // Backtraces space
-                    + (bt_size * 3 * sizeof(bt_vector_t))
-                    + (bt_size * 3 * sizeof(bt_prev_t));
     uint8_t* curr_alignment_wf_data_buffer = wf_data_buffer
-                                             + (wf_data_buffer_size * blockIdx.x);
+                    + (alignment_wf_data_buffer_size(penalties, max_steps) * blockIdx.x);
 
     wfa_offset_t* M_base = (wfa_offset_t*)curr_alignment_wf_data_buffer;
     wfa_offset_t* I_base = M_base + offsets_size;
-    wfa_offset_t* D_base = I_base + offsets_size;
+    wfa_offset_t* D_base = I_base + offsets_size_id;
 
-    // Backtrace vectors
-    bt_vector_t* M_bt_vector_base = (bt_vector_t*)(D_base + offsets_size);
-    bt_vector_t* I_bt_vector_base = M_bt_vector_base + bt_size;
-    bt_vector_t* D_bt_vector_base = I_bt_vector_base + bt_size;
-
-    // Baktrace vector pointers
-    bt_prev_t* M_bt_prev_base = (bt_prev_t*)(D_bt_vector_base + bt_size);
-    bt_prev_t* I_bt_prev_base = M_bt_prev_base + bt_size;
-    bt_prev_t* D_bt_prev_base = I_bt_prev_base + bt_size;
+    // Backtraces {vector, prev} stored together (8 bytes per cell)
+    wfa_backtrace_t* M_bt_base = (wfa_backtrace_t*)(D_base + offsets_size_id);
+    wfa_backtrace_t* I_bt_base = M_bt_base + bt_size;
+    wfa_backtrace_t* D_bt_base = I_bt_base + bt_size_id;
 
     // Wavefronts structres reside in shared
     wfa_wavefront_t* M_wavefronts = (wfa_wavefront_t*)sh_mem;
     wfa_wavefront_t* I_wavefronts = (M_wavefronts + active_working_set_size);
-    wfa_wavefront_t* D_wavefronts = (I_wavefronts + active_working_set_size);
+    wfa_wavefront_t* D_wavefronts = (I_wavefronts + ws_id);
 
     uint32_t* last_free_bt_position = (uint32_t*)
-                                          (D_wavefronts + active_working_set_size);
+                                          (D_wavefronts + ws_id);
 
     wfa_offset_t* M_sh_offsets_base = (wfa_offset_t*)(last_free_bt_position + 1);
     wfa_offset_t* I_sh_offsets_base = M_sh_offsets_base
                                       + (num_sh_offsets_per_wf * active_working_set_size);
     wfa_offset_t* D_sh_offsets_base = I_sh_offsets_base
-                                      + (num_sh_offsets_per_wf * active_working_set_size);
+                                      + (num_sh_offsets_per_wf * ws_id);
 
     for (int i=tid; i<active_working_set_size; i+=blockDim.x) {
         M_wavefronts[i].offsets[1] = M_base + (i * max_wf_size) + (max_wf_size/2);
         M_wavefronts[i].offsets[0] = M_sh_offsets_base
                                          + (i * num_sh_offsets_per_wf)
                                          + (num_sh_offsets_per_wf/2);
-        M_wavefronts[i].backtraces_vectors = M_bt_vector_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
-        M_wavefronts[i].backtraces_pointers = M_bt_prev_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
+        M_wavefronts[i].bt = M_bt_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
+        if (i >= ws_id) continue;
 
         I_wavefronts[i].offsets[1] = I_base + (i * max_wf_size) + (max_wf_size/2);
         I_wavefronts[i].offsets[0] = I_sh_offsets_base
                                          + (i * num_sh_offsets_per_wf)
                                          + (num_sh_offsets_per_wf/2);
-        I_wavefronts[i].backtraces_vectors = I_bt_vector_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
-        I_wavefronts[i].backtraces_pointers = I_bt_prev_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
+        I_wavefronts[i].bt = I_bt_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
 
         D_wavefronts[i].offsets[1] = D_base + (i * max_wf_size) + (max_wf_size/2);
         D_wavefronts[i].offsets[0] = D_sh_offsets_base
                                          + (i * num_sh_offsets_per_wf)
                                          + (num_sh_offsets_per_wf/2);
-        D_wavefronts[i].backtraces_vectors = D_bt_vector_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
-        D_wavefronts[i].backtraces_pointers = D_bt_prev_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
+        D_wavefronts[i].bt = D_bt_base + (i * max_wf_size_bt) + (max_wf_size_bt/2);
     }
 
+
+    // Initialise the global part of the wavefronts once per block. After each
+    // alignment only the diagonals it touched are reset (see end of loop), so
+    // the buffers are clean at the start of every alignment.
+    for (int i=tid; i<(offsets_size + 2 * offsets_size_id); i+=blockDim.x) M_base[i] = OFFSET_NULL;
+    for (int i=tid; i<(bt_size + 2 * bt_size_id); i+=blockDim.x) {
+        st_bt(&M_bt_base[i], make_uint2(0, 0));
+    }
+    __syncthreads();
 
     // Iterate until there are no more alignments in the pool to compute
     while (alignment_idx < num_alignments) {
@@ -493,42 +377,17 @@ __global__ void alignment_kernel (
         // recover)
         *last_free_bt_position = 1;
 
-        // Initialize all wavefronts to NULL
-        for (int i=tid; i<(offsets_size * 3); i+=blockDim.x) {
-#if __CUDA_ARCH__ >= 800
-            __stwt(&M_base[i], OFFSET_NULL);
-#else
-            M_base[i] = OFFSET_NULL;
-#endif
-        }
         // Shared mem
-        for (int i=tid; i<(num_sh_offsets_per_wf * active_working_set_size * 3); i+=blockDim.x) {
+        for (int i=tid; i<(num_sh_offsets_per_wf * (active_working_set_size + 2 * ws_id)); i+=blockDim.x) {
             M_sh_offsets_base[i] =  OFFSET_NULL;
         }
 
-        // Initialise all backtrace vectors to 0
-        for (int i=tid; i<(bt_size * 3); i+=blockDim.x) {
-#if __CUDA_ARCH__ >= 800
-            __stwt(&M_bt_vector_base[i], 0);
-#else
-            M_bt_vector_base[i] = 0;
-
-#endif
-        }
-
-        // Initialise all backtrace pointers to 0
-        for (int i=tid; i<(bt_size * 3); i+=blockDim.x) {
-#if __CUDA_ARCH__ >= 800
-            __stwt(&M_bt_prev_base[i], 0);
-#else
-            M_bt_prev_base[i] = 0;
-#endif
-        }
 
         for (int i=tid; i<active_working_set_size; i+=blockDim.x) {
             M_wavefronts[i].hi = 0;
             M_wavefronts[i].lo = 0;
             M_wavefronts[i].exist = false;
+            if (i >= ws_id) continue;
 
             I_wavefronts[i].hi = 0;
             I_wavefronts[i].lo = 0;
@@ -562,6 +421,11 @@ __global__ void alignment_kernel (
         const wfa_offset_t target_offset = EWAVEFRONT_OFFSET(tlen, plen);
 
         bool finished = false;
+        // Range of diagonals written during this alignment
+        int touched_lo = 0, touched_hi = 0;
+        // Ring slot of the current ~I/~D wavefront. The exist flag of each
+        // slot records whether ~I/~D was computed at that distance.
+        int curr_id = 0;
 
         int distance = 0;
         // steps = number of editions
@@ -569,13 +433,10 @@ __global__ void alignment_kernel (
         // TODO: target_k_abs <= distance or <= steps (?)
         if (!(target_k_abs <= distance && M_wavefronts[curr_wf].exist && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset)) {
 
-            update_curr_wf(
-                M_wavefronts,
-                I_wavefronts,
-                D_wavefronts,
-                active_working_set_size,
-                max_wf_size,
-                &curr_wf);
+            // Wavefronts are read "forward" in the rings, so the current index
+            // moves backwards
+            curr_wf = ring_dec(curr_wf, active_working_set_size);
+            curr_id = ring_dec(curr_id, ws_id);
 
             distance++;
             steps++;
@@ -585,14 +446,14 @@ __global__ void alignment_kernel (
 
                 bool M_exist = false;
                 bool GAP_exist = false;
-                const int o_delta = (curr_wf + o + e) % active_working_set_size;
-                const int e_delta = (curr_wf + e) % active_working_set_size;
-                const int x_delta = (curr_wf + x) % active_working_set_size;
+                const int o_delta = ring_add(curr_wf, o + e, active_working_set_size);
+                const int x_delta = ring_add(curr_wf, x, active_working_set_size);
+                bool ID_computed = false;
                 if ((distance - o - e) >= 0) {
                     // Just test ~I matrix as it will exist at the same wavefronts
                     // as ~D
                     GAP_exist = M_wavefronts[o_delta].exist ||
-                                I_wavefronts[e_delta].exist;
+                                I_wavefronts[ring_add(curr_id, e, ws_id)].exist;
                 }
 
                 if (GAP_exist) {
@@ -605,8 +466,6 @@ __global__ void alignment_kernel (
 
                 if (!GAP_exist && !M_exist) {
                     M_wavefronts[curr_wf].exist = false;
-                    D_wavefronts[curr_wf].exist = false;
-                    I_wavefronts[curr_wf].exist = false;
                     distance++;
                 } else {
                     if (M_exist && !GAP_exist) {
@@ -614,12 +473,12 @@ __global__ void alignment_kernel (
                                text, pattern, tlen, plen, num_sh_offsets_per_wf/2,
                                last_free_bt_position, offloaded_backtraces,
                                distance);
-                        D_wavefronts[curr_wf].exist = false;
-                        I_wavefronts[curr_wf].exist = false;
                     } else {
+                        ID_computed = true;
                         next_MDI(
                             M_wavefronts, I_wavefronts, D_wavefronts,
                             curr_wf, active_working_set_size,
+                            curr_id, ws_id,
                             x, o, e,
                             text, pattern, tlen, plen, num_sh_offsets_per_wf/2,
                             last_free_bt_position, offloaded_backtraces,
@@ -633,8 +492,15 @@ __global__ void alignment_kernel (
                     // TODO: This is necessary for now, try to find a less sync
                     // version
                     __syncthreads();
+                    touched_lo = MIN(touched_lo, (int)M_wavefronts[curr_wf].lo);
+                    touched_hi = MAX(touched_hi, (int)M_wavefronts[curr_wf].hi);
 
-                    if (target_k_abs <= distance && M_exist && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset) {
+                    // target_k must lie inside the wavefront: outside it the
+                    // offsets are stale or beyond the allocated diagonals
+                    if (target_k_abs <= distance && M_exist
+                        && target_k >= M_wavefronts[curr_wf].lo
+                        && target_k <= M_wavefronts[curr_wf].hi
+                        && get_offset(&M_wavefronts[curr_wf], target_k, num_sh_offsets_per_wf/2) == target_offset) {
                         finished = true;
                         break;
                     }
@@ -642,13 +508,10 @@ __global__ void alignment_kernel (
                     distance++;
                 }
 
-            update_curr_wf(
-                M_wavefronts,
-                I_wavefronts,
-                D_wavefronts,
-                active_working_set_size,
-                max_wf_size,
-                &curr_wf);
+            // Slot is reused e+1 steps later, so always overwrite the flag
+            if (tid == 0) I_wavefronts[curr_id].exist = ID_computed;
+            curr_wf = ring_dec(curr_wf, active_working_set_size);
+            curr_id = ring_dec(curr_id, ws_id);
 
             __syncthreads();
             }
@@ -659,8 +522,14 @@ __global__ void alignment_kernel (
         if  (tid == 0) {
             results[alignment_idx].distance = distance;
             results[alignment_idx].finished = finished;
-            bt_vector_t bt_vector = M_wavefronts[curr_wf].backtraces_vectors[target_k];
-            bt_prev_t bt_pointer = M_wavefronts[curr_wf].backtraces_pointers[target_k];
+            // Unfinished alignments are recomputed on the CPU. Their target_k
+            // may be outside the wavefront (or the buffer), so do not read it.
+            bt_vector_t bt_vector = 0;
+            bt_prev_t bt_pointer = 0;
+            if (finished) {
+                bt_vector = M_wavefronts[curr_wf].bt[target_k].backtrace;
+                bt_pointer = M_wavefronts[curr_wf].bt[target_k].prev;
+            }
 
             results[alignment_idx].backtrace = {.backtrace = bt_vector,
                                              .prev = bt_pointer};
@@ -680,6 +549,28 @@ __global__ void alignment_kernel (
             }
 
             results[alignment_idx].num_bt_blocks = i;
+        }
+        __syncthreads();
+        // Reset only the diagonals touched by this alignment
+        {
+            const int c_lo = MAX(touched_lo - 1, -max_steps);
+            const int c_hi = MIN(touched_hi + 1, max_steps);
+            const int width = c_hi - c_lo + 1;
+            const int total = width * active_working_set_size;
+            for (int j=tid; j<total; j+=blockDim.x) {
+                const int slot = j / width;
+                const int k = c_lo + (j % width);
+                const int off_idx = slot * max_wf_size + (max_wf_size/2) + k;
+                const int bt_idx = slot * max_wf_size_bt + (max_wf_size_bt/2) + k;
+                M_base[off_idx] = OFFSET_NULL;
+                st_bt(&M_bt_base[bt_idx], make_uint2(0, 0));
+                if (slot < ws_id) {
+                    I_base[off_idx] = OFFSET_NULL;
+                    D_base[off_idx] = OFFSET_NULL;
+                    st_bt(&I_bt_base[bt_idx], make_uint2(0, 0));
+                    st_bt(&D_bt_base[bt_idx], make_uint2(0, 0));
+                }
+            }
         }
         // Get next alignment
         if (tid == 0) alignment_idx = get_alignment_idx(next_alignment_idx);
